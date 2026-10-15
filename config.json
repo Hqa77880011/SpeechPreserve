@@ -1,0 +1,21 @@
+{
+  "taps": [
+    3,
+    9,
+    17
+  ],
+  "latency_ms": [
+    0.2,
+    0.5,
+    1.0
+  ],
+  "memory_kib": [
+    1,
+    2,
+    4
+  ],
+  "hop_ms": 10.0,
+  "deadline_ms": 20.0,
+  "compute_budget": 9.0,
+  "damage_limit": 0.2
+}

@@ -123,3 +123,29 @@ upper bound for these components, not a measured whole-process/device peak.
 Initial profiles must be measured on the target device, and completed calls update
 only future decisions. No backend-risk training or device experiment has been run
 as part of the logic audit.
+
+## Selected executable FIR setting
+
+`backends.json` fixes real causal moving-average FIR backends of length 3/9/17
+at 16 kHz, 160-sample (10 ms) hops, 20 ms deadline, 1440 work units/hop, 256 KiB
+accounted memory, two-hop replay, 16-sample cross-fade and damage limit 0.2.
+This is the chosen frozen backend library; named neural models or downloaded
+weights are unnecessary. The risk head remains fitted/calibrated to actual
+waveforms emitted by these backends.
+
+```bash
+python -m speech_routing.runtime profile --input data/prepared/train.npz --config backends.json --output runs/profiled_backends.json
+python -m speech_routing.runtime fit-risk --train data/prepared/train.npz --calibration data/prepared/calibration.npz --config runs/profiled_backends.json --output runs/backend-risk.pt --epochs 100 --seed 13
+speech-routing execute --input data/prepared/test.npz --config runs/profiled_backends.json --model runs/backend-risk.pt --output runs/executed --variant full
+```
+
+Initial latency/workspace fields in backends.json are null and `profiled=false`;
+routing rejects them until the profile command fills actual observed per-call
+95th-percentile latency, work and workspace reports. Profiling uses noisy x only,
+with one aligned hop per call and no labels. It does not establish a worst-case
+hardware guarantee. Repeat profiling on the intended execution device/hop size.
+The fixed 1 ms algorithmic_delay_ms is an allowed delay budget for this declared
+causal FIR interface, not a measured device cost. Required inputs are real noisy/
+clean speech with disjoint training/calibration/test utterance groups; at least
+nine independent calibration groups per action are needed for a finite 90% bound.
+No profile measurement or risk fitting was executed in this source-only update.

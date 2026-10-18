@@ -134,6 +134,8 @@ def replay(frames, specifications, config, predict_risk):
     """Route a noisy sequence; clean targets are deliberately absent from this API."""
     if min(config["hop_ms"], config["deadline_ms"], config["compute_budget_units"]) <= 0:
         raise ValueError("Hop, deadline and compute budgets must be positive")
+    if config.get("profiled") is False:
+        raise ValueError("Run the profile command on the intended backend/device before routing")
     variant = config.get("variant", "full")
     if variant not in {"full", "no_preservation", "no_debt", "no_switch_cost"}:
         raise ValueError("Runtime variants: full, no_preservation, no_debt, no_switch_cost")
@@ -206,8 +208,8 @@ def execute(args):
         if "group" in archive and np.intersect1d(archive["group"], getattr(predict_risk, "excluded_groups", [])).size:
             raise ValueError("Execution/evaluation groups overlap backend-risk fitting/calibration")
         frames = archive["x"]
-        if frames.ndim != 3:
-            raise ValueError("x must be sequences,frames,samples with causal aligned hops")
+        if frames.ndim != 3 or frames.shape[-1] != round(config['sample_rate']*config['hop_ms']/1000):
+            raise ValueError("x must be sequences,frames,samples with the configured sample-rate/hop length")
         outputs, actions, all_records = [], [], []
         for sequence, waveform in enumerate(frames):
             output, action, records = replay(waveform, specifications, config, predict_risk)
@@ -242,6 +244,8 @@ def collect_risk_targets(data, specifications, config):
     """Measure frozen backend transitions on labeled training/calibration mixtures."""
     if data["x"].shape != data["y"].shape or data["x"].ndim != 3 or "group" not in data:
         raise ValueError("Backend-risk fitting requires aligned x/y sequences and independent group IDs")
+    if data['x'].shape[-1] != round(config['sample_rate']*config['hop_ms']/1000):
+        raise ValueError('Risk fitting hop length differs from sample_rate/hop_ms')
     features, actions, targets, groups = [], [], [], []
     for sequence, (noisy, clean) in enumerate(zip(data["x"], data["y"])):
         for old in range(-1, len(specifications)):
@@ -307,26 +311,63 @@ def fit_backend_risk(train, calibration, specifications, config, output, epochs=
                 "calibration_groups": np.unique(calibration["group"]).tolist()}, output)
 
 
+
+def profile_library(frames, specifications, config):
+    """Measure a frozen library on noisy hops, without routing or clean targets."""
+    import copy
+    frames=np.asarray(frames,dtype=float)
+    if frames.ndim!=3 or not frames.size or not np.isfinite(frames).all():
+        raise ValueError('Profiling x must be finite sequences,frames,samples')
+    if frames.shape[-1] != round(config['sample_rate']*config['hop_ms']/1000):
+        raise ValueError('Profile hop length differs from sample_rate/hop_ms')
+    measured=copy.deepcopy(config)
+    measured['backends']=copy.deepcopy(specifications)
+    for action in range(len(specifications)):
+        calls=[]
+        for sequence in frames:
+            engine=BackendExecutor(specifications,config['sample_rate'],0,0)
+            for frame in sequence:
+                _,record=engine.process(action,frame)
+                calls.extend(record['calls'])
+        measured['backends'][action].update(
+            latency_ms=float(np.quantile([row['latency_ms'] for row in calls],.95)),
+            work_units=float(max(row['work_units'] for row in calls)),
+            workspace_kib=float(max(row['workspace_kib'] for row in calls)))
+    measured['profiled']=True
+    measured['profile_scope']={'sequences':len(frames),'frames_per_sequence':frames.shape[1],
+                               'samples_per_hop':frames.shape[2],'batch_size':1,
+                               'latency_statistic':'observed_per_call_p95_ms',
+                               'memory_statistic':'backend_report_plus_router_buffer_accounting'}
+    return measured
+
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["fit-risk"])
-    parser.add_argument("--train", required=True)
-    parser.add_argument("--calibration", required=True)
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=13)
-    args = parser.parse_args()
-    config = json.loads(Path(args.config).read_text(encoding="utf-8"))
-    with np.load(args.train, allow_pickle=False) as archive:
-        train = {key: archive[key] for key in archive.files}
-    with np.load(args.calibration, allow_pickle=False) as archive:
-        calibration = {key: archive[key] for key in archive.files}
-    destination = Path(args.output)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    fit_backend_risk(train, calibration, config["backends"], config, destination, args.epochs, args.seed)
+    parser=argparse.ArgumentParser()
+    parser.add_argument('command',choices=['fit-risk','profile'])
+    parser.add_argument('--train')
+    parser.add_argument('--calibration')
+    parser.add_argument('--input')
+    parser.add_argument('--config',required=True)
+    parser.add_argument('--output',required=True)
+    parser.add_argument('--epochs',type=int,default=100)
+    parser.add_argument('--seed',type=int,default=13)
+    args=parser.parse_args()
+    config=json.loads(Path(args.config).read_text(encoding='utf-8'))
+    destination=Path(args.output);destination.parent.mkdir(parents=True,exist_ok=True)
+    if args.command=='profile':
+        if not args.input:parser.error('profile requires --input noisy x[N,T,F] NPZ')
+        with np.load(args.input,allow_pickle=False) as archive:
+            measured=profile_library(archive['x'],config['backends'],config)
+        destination.write_text(json.dumps(measured,indent=2,allow_nan=False),encoding='utf-8')
+    else:
+        if not args.train or not args.calibration:parser.error('fit-risk requires --train and --calibration')
+        with np.load(args.train,allow_pickle=False) as archive:
+            train={key:archive[key] for key in archive.files}
+        with np.load(args.calibration,allow_pickle=False) as archive:
+            calibration={key:archive[key] for key in archive.files}
+        fit_backend_risk(train,calibration,config['backends'],config,destination,args.epochs,args.seed)
 
 
-if __name__ == "__main__":
+if __name__=='__main__':
     main()

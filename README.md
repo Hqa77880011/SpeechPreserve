@@ -41,6 +41,6 @@ speech-routing execute --input data/voiced_modulation/test.npz --config analytic
 
 The generator writes role NPZs and source/setting metadata. `runs/analytic-risk.pt` contains fitted risk/calibration state. Execution writes actual waveform/action NPZ, call ledger and metrics. `completion_time_basis=analytic_operations` identifies abstract-clock deadlines separately from host timings.
 
-Keep `config.json` with the run; it contains model/data settings and the seed where the CLI does not expose one. Use separate output directories for different seeds/conditions.
+Keep `analytic_backends.json` and the generated `setting.json` with this run; they define the selected backends, operation clock and source seed. Use separate output directories for different seeds/conditions.
 
-Source inspection: Python 3.13.5, numpy 2.1.3, scipy 1.15.3, torch 2.7.1+cu118, scikit-learn 1.6.1, matplotlib 3.10.0 (installed versions inspected). Checks covered Python syntax, configuration parsing and CLI arguments. No training, full evaluation or CI was run in this update.
+Source inspection: Python 3.13.5, numpy 2.1.3, scipy 1.15.3, torch 2.7.1+cu118, scikit-learn 1.6.1, matplotlib 3.10.0 (installed versions inspected). Checks covered Python syntax, configuration parsing and CLI arguments. No training or full evaluation was run. The GitHub Actions workflow checks source syntax and package installation.

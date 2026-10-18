@@ -114,6 +114,11 @@ def scorer(config, model_path, action_names):
     state = torch.load(model_path, map_location="cpu", weights_only=True)
     if state.get("backend_names") != action_names:
         raise ValueError("Use a backend-risk checkpoint fitted/calibrated on these executed backend_names")
+    fitted=state['config']
+    if fitted.get('cost_mode','measured_host')!=config.get('cost_mode','measured_host'):
+        raise ValueError('Fit/calibrate backend risk with the selected execution cost mode')
+    if config.get('cost_mode')=='analytic_operations' and any(fitted.get(key)!=config.get(key) for key in ['operation_rate_per_ms','routing_work_units']):
+        raise ValueError('Analytic operation clock differs from the fitted risk checkpoint')
     model = risk_network(len(action_names))
     model.load_state_dict(state["risk_state"])
     model.eval()
@@ -130,20 +135,47 @@ def scorer(config, model_path, action_names):
     return score
 
 
+
+def execution_cost_ms(config, record):
+    """Use measured host time or an explicitly declared finite operation clock."""
+    if config.get('cost_mode','measured_host')=='analytic_operations':
+        rate=float(config['operation_rate_per_ms'])
+        if not np.isfinite(rate) or rate<=0:
+            raise ValueError('Analytic operation rate must be positive and finite')
+        return record['work_units']/rate
+    return record['latency_ms']
+
+
+def routing_cost_ms(config, elapsed_ms):
+    if config.get('cost_mode','measured_host')=='analytic_operations':
+        return execution_cost_ms(config,{'work_units':config['routing_work_units']})
+    return elapsed_ms
+
 def replay(frames, specifications, config, predict_risk):
     """Route a noisy sequence; clean targets are deliberately absent from this API."""
     if min(config["hop_ms"], config["deadline_ms"], config["compute_budget_units"]) <= 0:
         raise ValueError("Hop, deadline and compute budgets must be positive")
-    if config.get("profiled") is False:
+    mode=config.get('cost_mode','measured_host')
+    if mode not in {'analytic_operations','measured_host'}:
+        raise ValueError('Unknown execution cost mode')
+    if mode=='measured_host' and config.get("profiled") is False:
         raise ValueError("Run the profile command on the intended backend/device before routing")
+    if mode=='analytic_operations' and (not all(s.get('kind')=='fir' for s in specifications) or config['routing_work_units']<0):
+        raise ValueError('Analytic operation setting requires the explicit FIR library and nonnegative routing work')
     variant = config.get("variant", "full")
     if variant not in {"full", "no_preservation", "no_debt", "no_switch_cost"}:
         raise ValueError("Runtime variants: full, no_preservation, no_debt, no_switch_cost")
     names = [s["name"] for s in specifications]
     executor = BackendExecutor(specifications, config["sample_rate"], config.get("replay_frames", 2), config.get("crossfade_samples", 0))
-    latency = np.array([s["latency_ms"] for s in specifications], dtype=float)
-    work = np.array([s["work_units"] for s in specifications], dtype=float)
-    workspace = np.array([s["workspace_kib"] for s in specifications], dtype=float)
+    if mode=='analytic_operations':
+        samples=np.asarray(frames).shape[-1]
+        work=np.array([samples*len(s['taps']) for s in specifications],dtype=float)
+        latency=np.array([execution_cost_ms(config,{'work_units':v}) for v in work])
+        workspace=np.array([(samples+len(s['taps'])-1)*8/1024 for s in specifications])
+    else:
+        latency = np.array([s["latency_ms"] for s in specifications], dtype=float)
+        work = np.array([s["work_units"] for s in specifications], dtype=float)
+        workspace = np.array([s["workspace_kib"] for s in specifications], dtype=float)
     if not len(names) or len(set(names)) != len(names) or not np.isfinite(np.r_[latency, work, workspace]).all() or np.min(np.r_[latency, work, workspace]) < 0:
         raise ValueError("Unique backend names and nonnegative initial measurements are required")
     queue = debt = 0.
@@ -160,7 +192,10 @@ def replay(frames, specifications, config, predict_risk):
         changed = np.arange(len(names)) != executor.previous
         activation = changed * len(executor.history)
         old_latency = latency[executor.previous] if executor.previous >= 0 and config.get("crossfade_samples", 0) else 0.
-        duration = score_ms + latency * (1 + activation) + changed * old_latency
+        score_cost=routing_cost_ms(config,score_ms)
+        duration = score_cost + latency * (1 + activation) + changed * old_latency
+        if mode=='analytic_operations':
+            duration+=changed*2*min(config.get('crossfade_samples',0),len(frame))/config['operation_rate_per_ms']
         router_kib = ((4 if config.get("crossfade_samples", 0) and executor.previous >= 0 else 3) * frame.nbytes + sum(past.nbytes for past in executor.history)) / 1024
         memory = executor.resident_memory_kib + workspace + router_kib
         if config.get("crossfade_samples", 0) and executor.previous >= 0:
@@ -177,13 +212,15 @@ def replay(frames, specifications, config, predict_risk):
         if old >= 0 and feasible[old] and action >= 0 and utility[action] - utility[old] <= config.get("hysteresis", 0.):
             action = old
         output, measured = executor.process(action, frame)
-        completion = queue + score_ms + measured["latency_ms"]
+        completion = queue + score_cost + execution_cost_ms(config,measured)
         queue = max(0., completion - config["hop_ms"])
-        debt = 0. if variant == "no_debt" else max(0., debt + measured["work_units"] - config["compute_budget_units"])
+        accounted_work=measured['work_units']+(config['routing_work_units'] if mode=='analytic_operations' else 0.)
+        debt = 0. if variant == "no_debt" else max(0., debt + accounted_work - config["compute_budget_units"])
         # Completed calls update only future feasibility estimates.
         for call in measured["calls"]:
             i = call["action"]
-            latency[i] = .8 * latency[i] + .2 * call["latency_ms"]
+            call_cost=execution_cost_ms(config,call)
+            latency[i] = .8 * latency[i] + .2 * call_cost
             work[i] = .8 * work[i] + .2 * call["work_units"]
             workspace[i] = max(workspace[i], call["workspace_kib"])
         outputs.append(output)
@@ -191,6 +228,7 @@ def replay(frames, specifications, config, predict_risk):
         records.append({"tick": tick, "action": action, "name": names[action] if action >= 0 else "identity",
                         "damage_bound": [float(v) if np.isfinite(v) else None for v in risk], "feasible": feasible.tolist(), "queue_ms": queue,
                         "debt": debt, "completion_ms": completion, "scorer_ms": score_ms,
+                        "scorer_cost_ms":score_cost,"cost_mode":mode,"accounted_work_units":accounted_work,
                         "deadline_violation": config.get("algorithmic_delay_ms", 0.) + completion > config["deadline_ms"],
                         "memory_violation_accounted": measured["accounted_peak_memory_kib"] > config["memory_budget_kib"], **measured})
     return np.stack(outputs), np.asarray(actions), records
@@ -217,10 +255,14 @@ def execute(args):
             actions.append(action)
             all_records.extend(dict(row, sequence=sequence) for row in records)
         outputs, actions = np.stack(outputs), np.stack(actions)
-        metrics = {"deadline_violation_actual": float(np.mean([r["deadline_violation"] for r in all_records])),
+        cost_mode=config.get('cost_mode','measured_host')
+        metrics = {("deadline_violation_model" if cost_mode=='analytic_operations' else "deadline_violation_actual"): float(np.mean([r["deadline_violation"] for r in all_records])),
+                   "completion_time_basis":cost_mode,
+                   "data_source":str(archive['source'].item()) if 'source' in archive else 'user_supplied',
                    "memory_violation_accounted": float(np.mean([r["memory_violation_accounted"] for r in all_records])),
                    "backend_processing_p95_ms": float(np.quantile([r["latency_ms"] for r in all_records], .95)),
                    "completion_p95_ms": float(np.quantile([r["completion_ms"] for r in all_records], .95)),
+                   "total_accounted_work_units":sum(r['accounted_work_units'] for r in all_records),
                    "total_backend_calls": sum(len(r["calls"]) for r in all_records),
                    "total_replay_calls": sum(r["replay_calls"] for r in all_records),
                    "bypass_fraction": float(np.mean(actions < 0))}
@@ -256,8 +298,9 @@ def collect_risk_targets(data, specifications, config):
                     action = old if tick % 2 == 0 else new
                     feature = [frame.mean(), frame.std(), queue, debt]
                     output, measured = engine.process(action, frame)
-                    queue = max(0., queue + measured["latency_ms"] - config["hop_ms"])
-                    debt = max(0., debt + measured["work_units"] - config["compute_budget_units"])
+                    queue = max(0., queue + routing_cost_ms(config,0.) + execution_cost_ms(config,measured) - config["hop_ms"])
+                    accounted_work=measured['work_units']+(config['routing_work_units'] if config.get('cost_mode')=='analytic_operations' else 0.)
+                    debt = max(0., debt + accounted_work - config["compute_budget_units"])
                     energy = float(reference @ reference)
                     if action < 0 or energy <= 1e-8:
                         continue

@@ -145,7 +145,44 @@ routing rejects them until the profile command fills actual observed per-call
 with one aligned hop per call and no labels. It does not establish a worst-case
 hardware guarantee. Repeat profiling on the intended execution device/hop size.
 The fixed 1 ms algorithmic_delay_ms is an allowed delay budget for this declared
-causal FIR interface, not a measured device cost. Required inputs are real noisy/
+causal FIR interface, not a measured device cost. The optional measured-host setting uses real noisy/
 clean speech with disjoint training/calibration/test utterance groups; at least
 nine independent calibration groups per action are needed for a finite 90% bound.
 No profile measurement or risk fitting was executed in this source-only update.
+
+## Generate all inputs and use the finite operation-cost setting
+
+The selected source is an analytic voiced-modulation task. A modulated harmonic
+source with fixed formant envelopes and random loudness is mixed with an
+independent colored-noise stream at a declared SNR. It produces speech-like signal
+structure, without representing recorded speech or intelligible language.
+
+```bash
+python -m speech_routing.synthetic --output data/voiced_modulation --seed 13
+python -m speech_routing.runtime fit-risk --train data/voiced_modulation/train.npz --calibration data/voiced_modulation/calibration.npz --config analytic_backends.json --output runs/analytic-risk.pt --epochs 100 --seed 13
+speech-routing execute --input data/voiced_modulation/test.npz --config analytic_backends.json --model runs/analytic-risk.pt --output runs/analytic-execution --variant full
+```
+
+Generation includes framing at 16 kHz/160-sample hops and whole-utterance role
+assignment. The actual train/validation/calibration/test NPZ files contain noisy
+x, clean y, globally disjoint group IDs and source=analytic_voiced_modulation.
+Default counts are 48/12/12/24 independent utterances, each 100 hops. The clean
+signal and colored noise have separate RNG streams; clean references enter only
+risk fitting/calibration and retrospective scoring, never runtime routing.
+
+analytic_backends.json selects the actual FIR3/9/17 implementations with an
+explicit abstract operation clock: one tap/sample is one MAC unit, cross-fade
+costs two units/sample, routing reserves 384 units/hop, and 640 units represent
+one model millisecond. Queue/completion, feasibility, compute debt and risk-target
+resource states use this same clock, including routing/replay/cross-fade charges.
+This is a finite resource model, not a measured processor speed or device claim.
+Analytic per-action cost is derived from waveform length and FIR taps; null host
+profile fields are not used. Risk checkpoints verify cost-mode/clock consistency.
+
+Output completion_time_basis=analytic_operations and deadline_violation_model
+identify the abstract deadline results. Actual host elapsed fields stay separate
+and never update the analytic clock. To use real host timing instead, retain the
+optional profile→fit-risk→execute workflow with backends.json. No real device
+profile is required by the selected analytic setting, and none was measured here.
+No data/model download is needed. No generator, risk fitting, execution or metric
+collection command above was run during this source update.

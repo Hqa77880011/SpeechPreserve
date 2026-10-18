@@ -17,5 +17,7 @@
   "hop_ms": 10.0,
   "deadline_ms": 20.0,
   "compute_budget": 9.0,
-  "damage_limit": 0.2
+  "damage_limit": 0.2,
+  "memory_budget_kib": 4.0,
+  "switch_latency_ms": 0.05
 }

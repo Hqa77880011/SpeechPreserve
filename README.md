@@ -63,3 +63,7 @@ Classification reports accuracy, balanced accuracy, macro-F1, NLL, confidence EC
 Parameter counts and forward timing describe the executing process. Use batch size one and a declared device configuration for device latency comparisons. Physical energy and scores from external task evaluators require measured inputs; they are not inferred from parameter counts. All prediction arrays remain available for task-specific evaluation.
 
 The implementation uses the explicit core operations described above with configurable compact networks. Numeric conventions and application-specific information are stated with the method and data schema. The parameter file contains the current defaults.
+
+## Reproduction logic conventions
+
+The action profile uses memory_kib as the total peak resident footprint for each executable action, including any shared library/state footprint. memory_budget_kib is the allowed peak, and switch_latency_ms adds a scalar activation delay whenever the chosen action changes, including transitions from bypass. Deadline metrics use completion time before the hop drains the queue. The included FIR action library is a compact algorithmic setting; reproducing the full paper enhancement comparisons requires the registered enhancement models and measured device profiles.

@@ -44,3 +44,7 @@ def measure(p,d,c):
     x=p['prediction'];y=d['y'];gain=(x*y).sum((1,2))/np.maximum((y*y).sum((1,2)),1e-8);error=x-gain[:,None,None]*y
     sisdr=10*np.log10(np.maximum((gain[:,None,None]*y).reshape(len(y),-1).__pow__(2).sum(1),1e-8)/np.maximum((error**2).sum((1,2)),1e-8))
     return {'si_sdr_db':float(sisdr.mean()),'speech_gain_error':float(np.mean((gain-1)**2)),'bypass_fraction':float(np.mean(p['action']<0)),'deadline_violation':float(np.mean(p['completion_ms']>c.get('deadline_ms',20.))),'switch_fraction':float(np.mean(np.diff(p['action'],axis=1)!=0))}
+
+def execute(args):
+    from .runtime import execute as execute_backends
+    execute_backends(args)

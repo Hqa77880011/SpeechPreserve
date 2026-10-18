@@ -67,3 +67,59 @@ The implementation uses the explicit core operations described above with config
 ## Reproduction logic conventions
 
 The action profile uses memory_kib as the total peak resident footprint for each executable action, including any shared library/state footprint. memory_budget_kib is the allowed peak, and switch_latency_ms adds a scalar activation delay whenever the chosen action changes, including transitions from bypass. Deadline metrics use completion time before the hop drains the queue. The included FIR action library is a compact algorithmic setting; reproducing the full paper enhancement comparisons requires the registered enhancement models and measured device profiles.
+
+## Execute frozen enhancement backends on waveforms
+
+The original `train/evaluate` path is the compact FIR setting. The separate
+`execute` path runs the selected enhancement backend on each noisy hop. Activation
+resets the chosen backend and replays at most `replay_frames` past noisy hops;
+optional cross-fading executes both the old and new branches on the current hop.
+Only past/current noisy samples enter routing. Clean speech is read afterwards for
+scoring. Call ledgers include warm-up and cross-fade calls, actual host elapsed time,
+backend-reported operation counts, and declared memory accounting.
+
+A backend configuration contains `sample_rate`, `hop_ms`, `deadline_ms`,
+`algorithmic_delay_ms`, `compute_budget_units`, `memory_budget_kib`, `damage_limit`,
+`replay_frames`, `crossfade_samples`, and a `backends` array. Each entry has a unique
+`name` and initial measured `latency_ms`, `work_units`, `workspace_kib`. For a real
+causal FIR entry add `kind: "fir"` and `taps: [0.25, 0.5, 0.25]`. For an external
+frozen enhancement model add `module: "/absolute/path/backend.py"` and its
+`parameters` object. The local module exports
+`create_backend(parameters, sample_rate)`, returning an object with `reset()`,
+`resident_memory_kib`, and `process(frame)`; the latter returns a dictionary with
+`waveform` (finite, one aligned hop), `work_units` (actual work performed), and
+`workspace_kib` (measured temporary activation footprint). Device backends must
+synchronize before returning so host timing includes completion. Sample alignment
+and any fixed algorithmic delay belong to the declared backend contract. Existing
+weights are supplied locally; this repository does not download or impersonate
+RNNoise/DCCRN/other named enhancement models.
+
+Fit a backend-specific risk head from actual executed frozen-backend transitions:
+
+```bash
+python -m speech_routing.runtime fit-risk --train data/prepared/train.npz --calibration data/prepared/calibration.npz --config backends.json --output runs/backend-risk.pt
+speech-routing execute --input data/prepared/test.npz --config backends.json --model runs/backend-risk.pt --output runs/executed --variant full
+```
+
+`fit-risk` uses clean targets only on training/calibration groups, fits quality and
+amplitude-sensitive damage on the waveform after actual activation/replay/fade,
+and calibrates action-wise upper residual margins using held-out utterance maxima.
+Feature normalization is fitted on training groups. Test groups must be excluded.
+Too few calibration groups give infinite risk bounds and force the safe identity
+fallback. A local `scorer_module` exporting `score(frame, context, action_names)`
+can instead supply `quality` and nonnegative calibrated `damage_bound` vectors;
+its calibration and group separation are the caller's responsibility.
+
+Runtime variants are `full`, `no_preservation`, `no_debt`, and `no_switch_cost`;
+measured replay/fade costs are charged even when their utility term is ablated.
+`executed.npz` stores actual waveforms/actions; `execution.json` retains every call.
+`backend_processing_p95_ms` times backend execution, while `completion_p95_ms`
+includes scorer time and queued work. Deadline violation also includes declared
+algorithmic delay. `accounted_peak_memory_kib` sums backend resident/workspace
+reports and explicit router frame/replay/output buffers; overlapping reported
+output buffers can be counted twice conservatively. It is a declared accounting
+upper bound for these components, not a measured whole-process/device peak.
+`memory_violation_accounted` uses that same convention. Work units are not energy.
+Initial profiles must be measured on the target device, and completed calls update
+only future decisions. No backend-risk training or device experiment has been run
+as part of the logic audit.
